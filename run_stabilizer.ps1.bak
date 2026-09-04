@@ -1,0 +1,317 @@
+param(
+    [string]$Config = "config.json",
+    [string]$LogPath = ".\logs\stabilizer.log"
+)
+
+$ErrorActionPreference = "Stop"
+
+function Get-NowStamp {
+    return (Get-Date).ToString("HH:mm:ss")
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR")][string]$Level = "INFO"
+    )
+
+    $line = "[$(Get-NowStamp)] [$Level] $Message"
+    Write-Host $line
+    Add-Content -LiteralPath $LogPath -Value $line
+}
+
+function Invoke-PingMs {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetHost,
+        [int]$TimeoutMs = 900
+    )
+
+    $output = ping -n 1 -w $TimeoutMs $TargetHost 2>&1 | Out-String
+    $match = [regex]::Match($output, "time[=<](\d+)ms", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($match.Success) {
+        return [double]$match.Groups[1].Value
+    }
+
+    return $null
+}
+
+function Add-Sample {
+    param(
+        [AllowNull()]$History,
+        [AllowNull()]$Latency,
+        [int]$HistorySize
+    )
+
+    if ($null -eq $History) {
+        $History = New-Object System.Collections.ArrayList
+    }
+
+    if ($History -isnot [System.Collections.ArrayList]) {
+        $normalized = New-Object System.Collections.ArrayList
+        foreach ($item in @($History)) {
+            [void]$normalized.Add($item)
+        }
+        $History = $normalized
+    }
+
+    [void]$History.Add($Latency)
+    while ($History.Count -gt $HistorySize) {
+        $History.RemoveAt(0)
+    }
+
+    return ,([System.Collections.ArrayList]$History)
+}
+
+function Get-Stats {
+    param(
+        [AllowNull()]$History
+    )
+
+    if ($null -eq $History) {
+        return [pscustomobject]@{
+            avg_ms = 9999.0
+            jitter_ms = 9999.0
+            loss_percent = 100.0
+            score = 9999.0
+            latest_ms = $null
+        }
+    }
+
+    if ($History -isnot [System.Collections.ArrayList]) {
+        $normalized = New-Object System.Collections.ArrayList
+        foreach ($item in @($History)) {
+            [void]$normalized.Add($item)
+        }
+        $History = $normalized
+    }
+
+    if ($History.Count -eq 0) {
+        return [pscustomobject]@{
+            avg_ms = 9999.0
+            jitter_ms = 9999.0
+            loss_percent = 100.0
+            score = 9999.0
+            latest_ms = $null
+        }
+    }
+
+    $latencies = @($History | Where-Object { $_ -ne $null } | ForEach-Object { [double]$_ })
+    $misses = @($History | Where-Object { $_ -eq $null }).Count
+
+    if ($latencies.Count -eq 0) {
+        return [pscustomobject]@{
+            avg_ms = 9999.0
+            jitter_ms = 9999.0
+            loss_percent = 100.0
+            score = 9999.0
+            latest_ms = $null
+        }
+    }
+
+    $avg = ($latencies | Measure-Object -Average).Average
+
+    $jitter = 0.0
+    if ($latencies.Count -gt 1) {
+        $diffs = New-Object System.Collections.Generic.List[double]
+        for ($i = 1; $i -lt $latencies.Count; $i++) {
+            $prev = [double]$latencies[$i - 1]
+            $curr = [double]$latencies[$i]
+            [void]$diffs.Add([Math]::Abs($curr - $prev))
+        }
+        $jitter = ($diffs | Measure-Object -Average).Average
+    }
+
+    $loss = ([double]$misses / [double]$History.Count) * 100.0
+    $score = $avg + ($jitter * 1.7) + ($loss * 6.0)
+
+    return [pscustomobject]@{
+        avg_ms = [double]$avg
+        jitter_ms = [double]$jitter
+        loss_percent = [double]$loss
+        score = [double]$score
+        latest_ms = $History[$History.Count - 1]
+    }
+}
+
+function Test-IsSpike {
+    param(
+        [double]$Current,
+        [double]$Baseline,
+        [double]$AbsoluteLimit,
+        [double]$MultiplierLimit
+    )
+
+    return (($Current - $Baseline) -ge $AbsoluteLimit) -and ($Current -ge ($Baseline * $MultiplierLimit))
+}
+
+function Invoke-ProfileCommand {
+    param(
+        [string]$Command
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        return
+    }
+
+    cmd /c $Command | Out-Null
+}
+
+function Get-OrCreateHistory {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Store,
+        [Parameter(Mandatory = $true)][string]$TargetName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TargetName)) {
+        throw "target name is empty"
+    }
+
+    if (-not $Store.ContainsKey($TargetName) -or $null -eq $Store[$TargetName]) {
+        $Store[$TargetName] = New-Object System.Collections.ArrayList
+    }
+
+    return ,([System.Collections.ArrayList]$Store[$TargetName])
+}
+
+if (-not (Test-Path -LiteralPath $Config)) {
+    throw "Config file not found: $Config"
+}
+
+$logDirectory = Split-Path -Parent $LogPath
+if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not (Test-Path -LiteralPath $logDirectory)) {
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+}
+
+Write-Log -Message "Starting Valorant Stabilizer PowerShell runner"
+Write-Log -Message "Config: $Config"
+Write-Log -Message "Log file: $LogPath"
+
+$configRaw = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
+
+$targets = @()
+foreach ($target in @($configRaw.targets)) {
+    $name = [string]$target.name
+    $probeHost = [string]$target.host
+    $profile = [string]$target.profile
+
+    if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($probeHost)) {
+        continue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($profile)) {
+        $profile = "direct"
+    }
+
+    $targets += [pscustomobject]@{
+        name = $name.Trim()
+        host = $probeHost.Trim()
+        profile = $profile.Trim()
+    }
+}
+
+if ($targets.Count -eq 0) {
+    throw "Config must include at least one target in 'targets'."
+}
+
+$thresholds = $configRaw.thresholds
+$actions = $configRaw.actions
+$runtime = $configRaw.runtime
+$profileCommands = @{}
+
+foreach ($p in $configRaw.profile_commands.PSObject.Properties) {
+    $profileCommands[$p.Name] = [string]$p.Value
+}
+
+$histories = @{}
+foreach ($target in $targets) {
+    $name = [string]$target.name
+    [void](Get-OrCreateHistory -Store $histories -TargetName $name)
+}
+
+$activeTarget = [string]$targets[0].name
+$consecutiveSpikes = 0
+$lastSwitchedAt = [datetime]::MinValue
+
+Write-Log -Message "Valorant Stabilizer (PowerShell) running. Press Ctrl+C to stop."
+
+while ($true) {
+    try {
+        foreach ($target in $targets) {
+            $name = [string]$target.name
+            $history = Get-OrCreateHistory -Store $histories -TargetName $name
+
+            $latency = Invoke-PingMs -TargetHost ([string]$target.host)
+            $history = Add-Sample -History $history -Latency $latency -HistorySize ([int]$runtime.history_size)
+            $histories[$name] = $history
+        }
+
+        $statsByName = @{}
+        foreach ($target in $targets) {
+            $name = [string]$target.name
+            $history = Get-OrCreateHistory -Store $histories -TargetName $name
+            $statsByName[$name] = Get-Stats -History $history
+        }
+
+        $bestPair = $statsByName.GetEnumerator() | Sort-Object { $_.Value.score } | Select-Object -First 1
+        $bestTarget = [string]$bestPair.Key
+
+        $activeStats = $statsByName[$activeTarget]
+        $baselineStats = $statsByName[$bestTarget]
+
+        if ($null -ne $activeStats.latest_ms) {
+            $spike = Test-IsSpike -Current ([double]$activeStats.latest_ms) -Baseline ([double]$baselineStats.avg_ms) -AbsoluteLimit ([double]$thresholds.spike_over_baseline_ms) -MultiplierLimit ([double]$thresholds.spike_multiplier)
+            if ($spike -or ([double]$activeStats.loss_percent -gt [double]$thresholds.max_loss_percent)) {
+                $consecutiveSpikes++
+            } else {
+                $consecutiveSpikes = 0
+            }
+        }
+
+        $canSwitch = ((Get-Date) - $lastSwitchedAt).TotalSeconds -ge [double]$runtime.switch_cooldown_seconds
+        if ($bestTarget -ne $activeTarget -and $canSwitch) {
+            $activeTarget = $bestTarget
+            $lastSwitchedAt = Get-Date
+
+            if ([bool]$actions.enabled -and [bool]$actions.run_profile_command_on_switch) {
+                $targetMeta = $targets | Where-Object { [string]$_.name -eq $bestTarget } | Select-Object -First 1
+                $profile = [string]$targetMeta.profile
+                if ($profileCommands.ContainsKey($profile)) {
+                    Invoke-ProfileCommand -Command $profileCommands[$profile]
+                    Write-Log -Message "profile switch -> $profile"
+                }
+            }
+        }
+
+        if ([bool]$actions.enabled -and $consecutiveSpikes -ge [int]$thresholds.consecutive_spikes_for_action) {
+            if ([bool]$actions.flush_dns_on_spike) {
+                ipconfig /flushdns | Out-Null
+                Write-Log -Message "action -> ipconfig /flushdns"
+            }
+            if ([bool]$actions.apply_tcp_profile) {
+                netsh int tcp set global autotuninglevel=normal | Out-Null
+                netsh int tcp set global ecncapability=enabled | Out-Null
+                netsh int tcp set global rss=enabled | Out-Null
+                netsh int tcp set supplemental internet congestionprovider=ctcp | Out-Null
+                Write-Log -Message "action -> netsh tcp profile applied"
+            }
+            $consecutiveSpikes = 0
+        }
+
+        Write-Host ("-" * 78)
+        Write-Log -Message "active=$activeTarget consecutive_spikes=$consecutiveSpikes"
+
+        foreach ($target in $targets) {
+            $name = [string]$target.name
+            $st = $statsByName[$name]
+            $latest = if ($null -eq $st.latest_ms) { "timeout" } else { "{0}ms" -f [math]::Round([double]$st.latest_ms) }
+            $marker = if ($name -eq $activeTarget) { "*" } else { " " }
+
+            Write-Host ("{0} {1,-16} latest={2,-8} avg={3,6:N1}ms jitter={4,6:N1} loss={5,5:N1}% score={6,7:N1}" -f $marker, $name, $latest, [double]$st.avg_ms, [double]$st.jitter_ms, [double]$st.loss_percent, [double]$st.score)
+        }
+    } catch {
+        Write-Log -Level "ERROR" -Message ("runtime error: " + $_.Exception.Message)
+        Write-Log -Level "WARN" -Message "loop recovered after runtime error"
+    }
+
+    Start-Sleep -Milliseconds ([int]([double]$runtime.interval_seconds * 1000))
+}

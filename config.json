@@ -1,0 +1,74 @@
+{
+  "games": [
+    {
+      "name": "League of Legends",
+      "hosts": ["leagueoflegends.com", "riotgames.com"]
+    },
+    {
+      "name": "Valorant",
+      "hosts": ["playvalorant.com", "riotgames.com"]
+    },
+    {
+      "name": "World of Tanks",
+      "hosts": ["worldoftanks.com", "worldoftanks.eu"]
+    },
+    {
+      "name": "Minecraft (Hypixel)",
+      "hosts": ["mc.hypixel.net"]
+    },
+    {
+      "name": "CS2 / Dota (Steam)",
+      "hosts": ["steamcommunity.com"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "Cloudflare DNS",
+      "host": "1.1.1.1",
+      "profile": "dns_cloudflare"
+    },
+    {
+      "name": "Google DNS",
+      "host": "8.8.8.8",
+      "profile": "dns_google"
+    },
+    {
+      "name": "Quad9 DNS",
+      "host": "9.9.9.9",
+      "profile": "dns_quad9"
+    },
+    {
+      "name": "Cloudflare WARP",
+      "host": "1.0.0.1",
+      "profile": "warp"
+    }
+  ],
+  "dns_routes": {
+    "dns_cloudflare": ["1.1.1.1", "1.0.0.1"],
+    "dns_google": ["8.8.8.8", "8.8.4.4"],
+    "dns_quad9": ["9.9.9.9", "149.112.112.112"]
+  },
+  "profile_commands": {
+    "warp": "\"C:\\Program Files\\Cloudflare\\Cloudflare WARP\\warp-cli.exe\" connect"
+  },
+  "thresholds": {
+    "spike_over_baseline_ms": 20,
+    "spike_multiplier": 1.4,
+    "max_loss_percent": 2.0,
+    "consecutive_spikes_for_action": 3
+  },
+  "actions": {
+    "enabled": true,
+    "apply_tcp_profile": true,
+    "flush_dns_on_spike": false,
+    "reset_adapter_on_spike": false,
+    "run_profile_command_on_switch": true,
+    "allow_warp_auto_switch": false,
+    "allow_dns_route_switch": true
+  },
+  "runtime": {
+    "interval_seconds": 2.0,
+    "history_size": 30,
+    "switch_cooldown_seconds": 20
+  }
+}
