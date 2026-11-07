@@ -1,7 +1,11 @@
 param(
-    [string]$Config = "config.json",
-    [string]$LogPath = ".\logs\stabilizer.log",
-    [string]$Game = ""
+    [string]$Config = "$PSScriptRoot\config.json",
+    [string]$LogPath = "$PSScriptRoot\logs\stabilizer.log",
+    [string]$Game = "",
+    [switch]$Diagnose,
+    [switch]$Revert,
+    [ValidateRange(2, 120)][int]$SampleCount = 20,
+    [string]$DiagnosticHost = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -192,8 +196,9 @@ function Get-WarpStatus {
     if (-not $script:WarpAvailable) { return "unavailable" }
     try {
         $output = & $script:WarpCliPath status 2>&1 | Out-String
-        if ($output -match "Connected") { return "connected" }
-        if ($output -match "Disconnected") { return "disconnected" }
+        if ($LASTEXITCODE -ne 0) { return "error" }
+        if ($output -match '\bDisconnected\b') { return "disconnected" }
+        if ($output -match '\bConnected\b') { return "connected" }
         return "unknown"
     } catch {
         return "error"
@@ -262,6 +267,276 @@ function Restore-OriginalDns {
         ipconfig /flushdns 2>&1 | Out-Null
         Write-Log -Message "DNS restored to original settings."
     } catch {}
+}
+
+# ── Legacy tweak revert ──────────────────────────────────────────────────────
+# Older versions of this tool applied persistent TCP/registry changes and
+# switched DNS repeatedly. These helpers put Windows back to its defaults.
+
+$script:TcpInterfacesKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+$script:MultimediaKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+
+function Test-LegacyTweaksPresent {
+    try {
+        $mm = Get-ItemProperty -Path $script:MultimediaKey -ErrorAction SilentlyContinue
+        if ($mm) {
+            $nti = [int64]$mm.NetworkThrottlingIndex
+            if ($nti -eq -1 -or $nti -eq 4294967295 -or ([int64]$mm.SystemResponsiveness) -eq 0) { return $true }
+        }
+        foreach ($sub in @(Get-ChildItem -Path $script:TcpInterfacesKey -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty -Path $sub.PSPath -ErrorAction SilentlyContinue
+            if ($null -ne $p.TcpAckFrequency -or $null -ne $p.TCPNoDelay) { return $true }
+        }
+        $tcp = (netsh int tcp show global 2>&1 | Out-String)
+        if ($tcp -match 'ECN Capability\s*:\s*enabled' -or $tcp -match 'Initial RTO\s*:\s*2000') { return $true }
+    } catch {}
+    return $false
+}
+
+function Restore-WindowsNetworkDefaults {
+    param([hashtable]$KnownDnsSets)
+
+    if (-not $script:IsAdmin) {
+        Write-Log -Level "WARN" -Message "Reverting old tweaks requires Administrator; skipped."
+        return $false
+    }
+
+    Write-Log -Message "Reverting network tweaks left by older versions to Windows defaults..."
+
+    $tcpDefaults = @(
+        "netsh int tcp set global autotuninglevel=normal",
+        "netsh int tcp set global ecncapability=disabled",
+        "netsh int tcp set global timestamps=disabled",
+        "netsh int tcp set global nonsackrttresiliency=disabled",
+        "netsh int tcp set global initialRto=1000",
+        "netsh int tcp set global rss=enabled"
+    )
+    foreach ($c in $tcpDefaults) {
+        try { cmd /c $c 2>&1 | Out-Null } catch {}
+    }
+    Write-Log -Message "  TCP globals: ECN off, initial RTO 1000 ms, auto-tuning normal (Windows defaults)"
+
+    $removed = 0
+    foreach ($sub in @(Get-ChildItem -Path $script:TcpInterfacesKey -ErrorAction SilentlyContinue)) {
+        foreach ($valueName in @("TcpAckFrequency", "TCPNoDelay")) {
+            try {
+                $p = Get-ItemProperty -Path $sub.PSPath -Name $valueName -ErrorAction SilentlyContinue
+                if ($null -ne $p) {
+                    Remove-ItemProperty -Path $sub.PSPath -Name $valueName -ErrorAction Stop
+                    $removed++
+                }
+            } catch {}
+        }
+    }
+    if ($removed -gt 0) {
+        Write-Log -Message "  Removed TcpAckFrequency/TCPNoDelay from $removed interface value(s); takes effect after reboot"
+    }
+
+    try {
+        Set-ItemProperty -Path $script:MultimediaKey -Name "NetworkThrottlingIndex" -Value 10 -Type DWord -ErrorAction Stop
+        Set-ItemProperty -Path $script:MultimediaKey -Name "SystemResponsiveness" -Value 20 -Type DWord -ErrorAction Stop
+        Write-Log -Message "  Multimedia scheduler: NetworkThrottlingIndex=10, SystemResponsiveness=20 (Windows defaults)"
+    } catch {
+        Write-Log -Level "WARN" -Message "  Could not restore multimedia scheduler values: $($_.Exception.Message)"
+    }
+
+    # Only reset DNS when it still points at a server set this tool used to apply.
+    try {
+        $ifIndex = Get-ActiveAdapterIndex
+        if ($null -ne $ifIndex) {
+            $current = @((Get-DnsClientServerAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
+            $matchesKnown = $false
+            foreach ($set in $KnownDnsSets.Values) {
+                if ($current.Count -gt 0 -and (@(Compare-Object -ReferenceObject @($set) -DifferenceObject $current).Count -eq 0)) { $matchesKnown = $true }
+            }
+            if ($matchesKnown) {
+                Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ResetServerAddresses -ErrorAction Stop
+                ipconfig /flushdns 2>&1 | Out-Null
+                Write-Log -Message "  DNS reset to automatic (DHCP); it was still set to $($current -join ', ')"
+            }
+        }
+    } catch {
+        Write-Log -Level "WARN" -Message "  DNS check failed: $($_.Exception.Message)"
+    }
+
+    Write-Log -Message "Revert complete. Registry TCP changes need a reboot to fully apply."
+    return $true
+}
+
+# ── Session stabilization (reversible, undone on exit) ───────────────────────
+
+$script:SessionStateFile = Join-Path (Split-Path -Parent $LogPath) "session_state.json"
+$script:Session = @{
+    stopped_services = @()
+    wlan_interface   = $null
+    qos_policies     = @()
+    boosted_pids     = @()
+}
+
+function Save-SessionState {
+    try { $script:Session | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:SessionStateFile -Encoding UTF8 } catch {}
+}
+
+function Get-ActiveAdapter {
+    try {
+        $idx = Get-ActiveAdapterIndex
+        if ($null -eq $idx) { return $null }
+        return Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop
+    } catch { return $null }
+}
+
+function Test-IsWifiAdapter {
+    param($Adapter)
+    if ($null -eq $Adapter) { return $false }
+    return (([string]$Adapter.PhysicalMediaType) -match '802\.11|Wireless') -or ([int]$Adapter.InterfaceType -eq 71)
+}
+
+function Start-SessionStabilization {
+    param($Options, [string[]]$ProcessNames)
+
+    if (-not $script:IsAdmin) {
+        Write-Log -Level "WARN" -Message "Stabilization actions need Administrator (use run.bat). Running as monitor only."
+        return
+    }
+
+    $adapter = Get-ActiveAdapter
+    if ($adapter) {
+        Write-Log -Message ("Active adapter: {0} ({1})" -f $adapter.Name, $adapter.PhysicalMediaType)
+    }
+
+    # Background downloads (Windows Update / Delivery Optimization / BITS) saturate upload and inflate ping.
+    if ([bool]$Options.pause_background_downloads) {
+        foreach ($svcName in @("DoSvc", "BITS")) {
+            try {
+                $svc = Get-Service -Name $svcName -ErrorAction Stop
+                if ($svc.Status -eq 'Running') {
+                    Stop-Service -Name $svcName -Force -ErrorAction Stop
+                    $script:Session.stopped_services += $svcName
+                    Write-Log -Message "  Paused background download service: $svcName (restored on exit)"
+                }
+            } catch {
+                Write-Log -Level "WARN" -Message "  Could not pause ${svcName}: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # Windows' periodic Wi-Fi network scans cause 100-500 ms spikes roughly once a minute.
+    if ([bool]$Options.suppress_wifi_scanning -and (Test-IsWifiAdapter -Adapter $adapter)) {
+        try {
+            $out = netsh wlan set autoconfig enabled=no interface="$($adapter.Name)" 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                $script:Session.wlan_interface = [string]$adapter.Name
+                Write-Log -Message "  Wi-Fi background scanning suppressed on '$($adapter.Name)' (re-enabled on exit)"
+            } else {
+                Write-Log -Level "WARN" -Message "  Wi-Fi scan suppression failed: $($out.Trim())"
+            }
+        } catch {
+            Write-Log -Level "WARN" -Message "  Wi-Fi scan suppression failed: $($_.Exception.Message)"
+        }
+    }
+
+    # Adapter power saving adds wake-up latency; this change is persistent and safe.
+    if ([bool]$Options.disable_adapter_power_saving -and $adapter) {
+        try {
+            Disable-NetAdapterPowerManagement -Name $adapter.Name -NoRestart -ErrorAction Stop
+            Write-Log -Message "  Adapter power saving disabled on '$($adapter.Name)' (persistent)"
+        } catch {
+            Write-Log -Level "WARN" -Message "  Could not change adapter power management: $($_.Exception.Message)"
+        }
+    }
+
+    # DSCP 46 marks game packets as voice-class; Wi-Fi (WMM) and many routers prioritize them.
+    if ([bool]$Options.prioritize_game_traffic_dscp -and $ProcessNames.Count -gt 0) {
+        try {
+            $qosKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\QoS"
+            if (-not (Test-Path $qosKey)) { New-Item -Path $qosKey -Force | Out-Null }
+            # Non-domain PCs ignore local QoS policies unless this value is set.
+            Set-ItemProperty -Path $qosKey -Name "Do not use NLA" -Value "1" -Type String -ErrorAction Stop
+        } catch {
+            Write-Log -Level "WARN" -Message "  QoS registry prerequisite failed: $($_.Exception.Message)"
+        }
+        foreach ($proc in $ProcessNames) {
+            $policyName = "GameStabilizer $proc"
+            try {
+                Remove-NetQosPolicy -Name $policyName -Confirm:$false -ErrorAction SilentlyContinue
+                New-NetQosPolicy -Name $policyName -AppPathNameMatchCondition "$proc.exe" -DSCPAction 46 -NetworkProfile All -ErrorAction Stop | Out-Null
+                $script:Session.qos_policies += $policyName
+            } catch {
+                Write-Log -Level "WARN" -Message "  QoS policy for $proc failed: $($_.Exception.Message)"
+            }
+        }
+        if ($script:Session.qos_policies.Count -gt 0) {
+            Write-Log -Message ("  Game traffic marked DSCP 46 for: {0} (removed on exit)" -f ($ProcessNames -join ", "))
+        }
+    }
+
+    Save-SessionState
+}
+
+function Update-GameProcessPriority {
+    param([string[]]$ProcessNames)
+    $found = @()
+    foreach ($proc in $ProcessNames) {
+        foreach ($p in @(Get-Process -Name $proc -ErrorAction SilentlyContinue)) {
+            $found += $p.ProcessName
+            try {
+                if ($p.PriorityClass -ne [System.Diagnostics.ProcessPriorityClass]::High) {
+                    $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+                    if ($script:Session.boosted_pids -notcontains $p.Id) {
+                        $script:Session.boosted_pids += $p.Id
+                        Save-SessionState
+                    }
+                    Write-Log -Message "  Game process '$($p.ProcessName)' (PID $($p.Id)) set to High priority"
+                }
+            } catch {}
+        }
+    }
+    return ,$found
+}
+
+function Stop-SessionStabilization {
+    param([hashtable]$State = $script:Session)
+
+    foreach ($svcName in @($State.stopped_services)) {
+        try {
+            Start-Service -Name $svcName -ErrorAction Stop
+            Write-Log -Message "  Restarted service: $svcName"
+        } catch {}
+    }
+    if ($State.wlan_interface) {
+        try {
+            netsh wlan set autoconfig enabled=yes interface="$($State.wlan_interface)" 2>&1 | Out-Null
+            Write-Log -Message "  Wi-Fi auto-config re-enabled on '$($State.wlan_interface)'"
+        } catch {}
+    }
+    foreach ($policy in @($State.qos_policies)) {
+        try { Remove-NetQosPolicy -Name $policy -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    }
+    if (@($State.qos_policies).Count -gt 0) { Write-Log -Message "  QoS policies removed" }
+    foreach ($procId in @($State.boosted_pids)) {
+        try {
+            $p = Get-Process -Id ([int]$procId) -ErrorAction SilentlyContinue
+            if ($p) { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal }
+        } catch {}
+    }
+    try { Remove-Item -LiteralPath $script:SessionStateFile -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+function Restore-PreviousSessionIfNeeded {
+    if (-not (Test-Path -LiteralPath $script:SessionStateFile)) { return }
+    try {
+        $raw = Get-Content -LiteralPath $script:SessionStateFile -Raw | ConvertFrom-Json
+        $state = @{
+            stopped_services = @($raw.stopped_services)
+            wlan_interface   = $raw.wlan_interface
+            qos_policies     = @($raw.qos_policies)
+            boosted_pids     = @($raw.boosted_pids)
+        }
+        Write-Log -Level "WARN" -Message "Previous session did not exit cleanly; restoring its changes first."
+        Stop-SessionStabilization -State $state
+    } catch {
+        try { Remove-Item -LiteralPath $script:SessionStateFile -Force -ErrorAction SilentlyContinue } catch {}
+    }
 }
 
 function Select-Game {
@@ -357,13 +632,53 @@ function Get-OrCreateHistory {
     return ,([System.Collections.ArrayList]$Store[$TargetName])
 }
 
-if (-not (Test-Path -LiteralPath $Config)) {
-    throw "Config file not found: $Config"
-}
-
 $logDirectory = Split-Path -Parent $LogPath
 if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not (Test-Path -LiteralPath $logDirectory)) {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+}
+
+if ($Diagnose) {
+    Write-Log -Message "Read-only diagnostics: $SampleCount pings per host; no administrator access required."
+    $diagnosticTargets = @()
+    try {
+        $adapters = @(Get-NetIPConfiguration -ErrorAction Stop |
+            Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' })
+        foreach ($adapter in $adapters) {
+            foreach ($gateway in $adapter.IPv4DefaultGateway) {
+                $diagnosticTargets += [pscustomobject]@{
+                    name = "Gateway ($($adapter.InterfaceAlias))"
+                    host = [string]$gateway.NextHop
+                }
+            }
+        }
+    } catch {
+        Write-Log -Level "WARN" -Message "Could not discover the gateway: $($_.Exception.Message)"
+    }
+    if ($diagnosticTargets.Count -eq 0) {
+        Write-Log -Level "WARN" -Message "No active IPv4 gateway found; local-link diagnosis is unavailable."
+    }
+    $diagnosticTargets += [pscustomobject]@{ name = "Internet (Cloudflare)"; host = "1.1.1.1" }
+    $diagnosticTargets += [pscustomobject]@{ name = "Internet (Google)"; host = "8.8.8.8" }
+    if (-not [string]::IsNullOrWhiteSpace($DiagnosticHost)) {
+        $diagnosticTargets += [pscustomobject]@{ name = "User-supplied game host"; host = $DiagnosticHost.Trim() }
+    }
+    foreach ($target in $diagnosticTargets) {
+        Write-Log -Message "Testing $($target.name): $($target.host)"
+        & "$env:SystemRoot\System32\PING.EXE" -n $SampleCount -w 1000 $target.host |
+            ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace([string]$_)) {
+                    Write-Log -Message ([string]$_)
+                }
+            }
+    }
+    Write-Log -Message "Gateway spikes suggest the local link/router; stable gateway with Internet spikes suggests an upstream issue."
+    Write-Log -Message "ICMP can be filtered or deprioritized. These sequential samples cannot prove where game packet loss occurs."
+    Write-Log -Message "Repeat during stuttering; compare with the game's own latency and packet-loss display."
+    return
+}
+
+if (-not (Test-Path -LiteralPath $Config)) {
+    throw "Config file not found: $Config"
 }
 
 # ── Admin Check ──────────────────────────────────────────────────────────────
@@ -474,7 +789,12 @@ foreach ($g in @($configRaw.games)) {
         if (-not [string]::IsNullOrWhiteSpace($hs)) { $ghosts += $hs.Trim() }
     }
     if ($ghosts.Count -eq 0) { continue }
-    $games += [pscustomobject]@{ name = $gname.Trim(); hosts = $ghosts }
+    $gprocs = @()
+    foreach ($pn in @($g.processes)) {
+        $ps = [string]$pn
+        if (-not [string]::IsNullOrWhiteSpace($ps)) { $gprocs += ($ps.Trim() -replace '\.exe$', '') }
+    }
+    $games += [pscustomobject]@{ name = $gname.Trim(); hosts = $ghosts; processes = $gprocs }
 }
 
 if ($games.Count -eq 0) {
@@ -489,6 +809,15 @@ foreach ($p in $configRaw.dns_routes.PSObject.Properties) {
         if (-not [string]::IsNullOrWhiteSpace($ss)) { $servers += $ss.Trim() }
     }
     $script:DnsRoutes[$p.Name] = $servers
+}
+
+$stabilize = $configRaw.stabilize
+if ($null -eq $stabilize) { $stabilize = [pscustomobject]@{ enabled = $false } }
+
+if ($Revert) {
+    [void](Restore-WindowsNetworkDefaults -KnownDnsSets $script:DnsRoutes)
+    Restore-PreviousSessionIfNeeded
+    return
 }
 
 # Route candidates (what the tool actually switches between)
@@ -520,11 +849,13 @@ foreach ($p in $configRaw.profile_commands.PSObject.Properties) {
 $selectedGame = Select-Game -Games $games -Requested $Game
 
 $monitors = @()
+$gameProcesses = @()
 if ($selectedGame -eq "ALL") {
     foreach ($g in $games) {
         foreach ($h in $g.hosts) {
             $monitors += [pscustomobject]@{ name = ("{0}: {1}" -f $g.name, $h); host = $h; profile = "direct"; role = "monitor" }
         }
+        $gameProcesses += @($g.processes)
     }
     Write-Log -Message "Selected game: ALL GAMES (monitoring everything)"
 } else {
@@ -532,12 +863,29 @@ if ($selectedGame -eq "ALL") {
     foreach ($h in $g.hosts) {
         $monitors += [pscustomobject]@{ name = ("{0}: {1}" -f $g.name, $h); host = $h; profile = "direct"; role = "monitor" }
     }
+    $gameProcesses += @($g.processes)
     Write-Log -Message "Selected game: $selectedGame"
 }
+$gameProcesses = @($gameProcesses | Select-Object -Unique)
 
-# Combined ping set: game monitors (spike watch) + route candidates (switchable)
+# Gateway probe: tells local link (Wi-Fi/router) spikes apart from upstream ones.
+$gatewayTarget = $null
+try {
+    $gwCfg = Get-NetIPConfiguration -ErrorAction Stop |
+        Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+        Select-Object -First 1
+    if ($gwCfg) {
+        $gwHost = [string]($gwCfg.IPv4DefaultGateway | Select-Object -First 1).NextHop
+        if (-not [string]::IsNullOrWhiteSpace($gwHost)) {
+            $gatewayTarget = [pscustomobject]@{ name = "Gateway (router)"; host = $gwHost; profile = "direct"; role = "gateway" }
+        }
+    }
+} catch {}
+
+# Combined ping set: game monitors (spike watch) + gateway + route candidates (switchable)
 $targets = @()
 $targets += $monitors
+if ($gatewayTarget) { $targets += $gatewayTarget }
 $targets += $routeTargets
 
 # Detect Cloudflare WARP
@@ -551,8 +899,8 @@ if ($script:WarpCliPath) {
         $script:CurrentProfile = "warp"
     }
     Write-Host "" -ForegroundColor Green
-    Write-Host "  WARP is available! The stabilizer will auto-switch" -ForegroundColor Green
-    Write-Host "  between direct and WARP based on which route is faster." -ForegroundColor Green
+    Write-Host "  WARP is installed. Its current connection is left unchanged." -ForegroundColor Green
+    Write-Host "  Compare WARP on/off manually between matches, not during play." -ForegroundColor Green
     Write-Host ""
 } else {
     Write-Log -Level "WARN" -Message "Cloudflare WARP: NOT FOUND"
@@ -562,10 +910,20 @@ if ($script:WarpCliPath) {
 
 # Startup network changes are opt-in. The default monitor-only mode must not
 # modify DNS, TCP, registry settings, or the active route.
-    if ([bool]$actions.enabled -and [bool]$actions.apply_tcp_profile) {
+if ([bool]$actions.enabled -and [bool]$actions.apply_tcp_profile) {
     Set-NetworkOptimizations -IsAdmin $isAdmin
 } else {
-    Write-Log -Message "Monitor-only mode: startup network changes skipped."
+    Write-Log -Message "Startup network changes skipped."
+}
+
+Restore-PreviousSessionIfNeeded
+
+if ([bool]$stabilize.enabled) {
+    if ([bool]$stabilize.revert_legacy_tweaks -and (Test-LegacyTweaksPresent)) {
+        [void](Restore-WindowsNetworkDefaults -KnownDnsSets $script:DnsRoutes)
+    }
+    Write-Log -Message "Applying session stabilization (all changes undone on Ctrl+C)..."
+    Start-SessionStabilization -Options $stabilize -ProcessNames $gameProcesses
 }
 
 $histories = @{}
@@ -580,30 +938,24 @@ $rtInit = $routeTargets | Where-Object { [string]$_.profile -eq $script:CurrentP
 if ($rtInit) { $activeRouteName = [string]$rtInit.name } elseif ($routeTargets.Count -gt 0) { $activeRouteName = [string]$routeTargets[0].name }
 
 $consecutiveSpikes = 0
-$lastSwitchedAt = [datetime]::MinValue
 $totalCycles = 0
 $totalFlushes = 0
-$totalSwitches = 0
 
 Write-Host ""
-Write-Log -Message "Stabilizing for: $selectedGame  (monitors: $($monitors.Count), routes: $($routeTargets.Count))"
+Write-Log -Message "Monitoring: $selectedGame  (configured hosts: $($monitors.Count), reference probes: $($routeTargets.Count))"
 
-# A real reroute is possible via WARP, or via DNS route switching when running as admin.
-$dnsRouteReady = ($script:IsAdmin -and $script:DnsRoutes.Count -gt 0)
-$script:CanReroute = [bool]$script:WarpAvailable -or $dnsRouteReady
-
-if ($script:WarpAvailable -and $script:IsAdmin) {
-    Write-Log -Message "MODE: ACTIVE - WARP + DNS route switching + system tweaks enabled."
-} elseif ($script:WarpAvailable) {
-    Write-Log -Level "WARN" -Message "MODE: PARTIAL - WARP route switching on; run as Administrator for DNS routes + TCP tweaks."
-} elseif ($dnsRouteReady) {
-    Write-Log -Message "MODE: ACTIVE (DNS) - no WARP, but admin DNS route switching is enabled."
-    Write-Log -Message "  The tool A/B tests DNS providers (Cloudflare / Google / Quad9) and keeps the fastest."
-    Write-Log -Message "  This is a modest but real lever; it does not tunnel game packets like WARP/ExitLag."
+if ([bool]$actions.enabled) {
+    Write-Log -Message "MODE: MONITOR + opted-in legacy DNS flush/TCP actions; no automatic rerouting."
+} elseif ([bool]$stabilize.enabled -and $script:IsAdmin) {
+    Write-Log -Message "MODE: STABILIZE - background downloads paused, Wi-Fi scan spikes suppressed, game traffic/process prioritized."
 } else {
-    Write-Log -Level "WARN" -Message "MODE: MONITOR-ONLY - no reroute available."
-    Write-Log -Level "WARN" -Message "  Run as Administrator to enable DNS route switching, or install Cloudflare WARP."
+    Write-Log -Message "MODE: MONITOR-ONLY - network settings remain unchanged, including when running as administrator."
 }
+if ([bool]$actions.enabled -and [bool]$actions.run_profile_command_on_switch) {
+    Write-Log -Level "WARN" -Message "Automatic profile switching is disabled: pings to different hosts do not compare direct versus VPN routes."
+}
+Write-Log -Level "WARN" -Message "DNS changes and TCP tweaks do not fix live UDP game jitter. Administrator access alone cannot stabilize ping."
+Write-Log -Message "Configured publisher websites are reference hosts, not necessarily your match server. Use -Diagnose to check the local link and Internet."
 Write-Host ""
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
@@ -657,6 +1009,7 @@ try {
             }
 
             # Spike detection on the chosen game (compared to its own normal latency)
+            $spikeOrigin = ""
             if ($null -ne $rep) {
                 $spike = Test-IsSpike -Current ([double]$rep.latest_ms) `
                                       -Baseline ([double]$rep.avg_ms) `
@@ -664,44 +1017,24 @@ try {
                                       -MultiplierLimit ([double]$thresholds.spike_multiplier)
                 if ($spike -or ([double]$rep.loss_percent -gt [double]$thresholds.max_loss_percent)) {
                     $consecutiveSpikes++
+                    if ($gatewayTarget) {
+                        $gw = $statsByName[[string]$gatewayTarget.name]
+                        $gwSpiking = ($null -eq $gw.latest_ms) -or ([double]$gw.latest_ms -ge 10.0 -and [double]$gw.latest_ms -ge ([double]$gw.avg_ms * 2.0))
+                        $spikeOrigin = if ($gwSpiking) { "LOCAL (Wi-Fi/router)" } else { "UPSTREAM (ISP/route)" }
+                    }
                 } else {
                     $consecutiveSpikes = 0
                 }
             }
 
-            # Switch route if a better one is found and cooldown has elapsed
-            $canSwitch = ((Get-Date) - $lastSwitchedAt).TotalSeconds -ge [double]$runtime.switch_cooldown_seconds
-            if ($bestRoute -ne $activeRouteName -and $canSwitch) {
-                $prevRoute = $activeRouteName
+            if ([bool]$stabilize.enabled -and [bool]$stabilize.boost_game_process_priority -and $gameProcesses.Count -gt 0) {
+                $runningGames = Update-GameProcessPriority -ProcessNames $gameProcesses
+            } else {
+                $runningGames = @()
+            }
+
+            if ($bestRoute -ne $activeRouteName) {
                 $activeRouteName = $bestRoute
-                $lastSwitchedAt = Get-Date
-
-                $rtMeta = $routeTargets | Where-Object { [string]$_.name -eq $bestRoute } | Select-Object -First 1
-                $newProfile = [string]$rtMeta.profile
-
-                $allowWarp = $true
-                $allowDns = $true
-                if ($null -ne $actions.PSObject.Properties['allow_warp_auto_switch']) {
-                    $allowWarp = [bool]$actions.allow_warp_auto_switch
-                }
-                if ($null -ne $actions.PSObject.Properties['allow_dns_route_switch']) {
-                    $allowDns = [bool]$actions.allow_dns_route_switch
-                }
-
-                $profileSupported = (($newProfile -eq 'warp') -and $script:WarpAvailable -and $allowWarp) `
-                    -or ($script:DnsRoutes.ContainsKey($newProfile) -and $script:IsAdmin -and $allowDns) `
-                    -or (($newProfile -ne 'warp') -and $profileCommands.ContainsKey($newProfile))
-
-                $reroutes = [bool]$actions.enabled -and [bool]$actions.run_profile_command_on_switch `
-                            -and ($newProfile -ne $script:CurrentProfile) -and $profileSupported
-
-                if ($reroutes) {
-                    $totalSwitches++
-                    Write-Log -Level "WARN" -Message "Route switch (rerouting): $prevRoute -> $bestRoute"
-                    Switch-ToProfile -ProfileName $newProfile -ProfileCommands $profileCommands
-                } else {
-                    Write-Log -Message "Best route now: $bestRoute (no reroute applied; needs admin/WARP or same profile)"
-                }
             }
 
             # Take action if consecutive spikes on the game exceed the threshold
@@ -735,9 +1068,21 @@ try {
             $statusColor = if ($consecutiveSpikes -ge 2) { "Red" } elseif ($consecutiveSpikes -ge 1) { "Yellow" } else { "Green" }
             $repPing = if ($null -eq $rep) { "no-ping" } else { "{0}ms" -f [math]::Round([double]$rep.latest_ms) }
             $warpTag = if ($script:WarpAvailable) { "  warp=$($script:CurrentProfile)" } else { "" }
-            Write-Host ("[$(Get-NowStamp)] GAME=$selectedGame  ping=$repPing  route=$activeRouteName  profile=$($script:CurrentProfile)  spikes=$consecutiveSpikes  cycle=$totalCycles  switches=$totalSwitches$warpTag") -ForegroundColor $statusColor
+            $gameTag = if ($runningGames.Count -gt 0) { "  game_running=$($runningGames -join ',')" } else { "" }
+            $originTag = if ($spikeOrigin) { "  spike_origin=$spikeOrigin" } else { "" }
+            Write-Host ("[$(Get-NowStamp)] GAME=$selectedGame  reference_ping=$repPing  spikes=$consecutiveSpikes  cycle=$totalCycles$warpTag$gameTag$originTag") -ForegroundColor $statusColor
+            if ($spikeOrigin -and $consecutiveSpikes -ge [int]$thresholds.consecutive_spikes_for_action) {
+                Write-Log -Level "WARN" -Message "Sustained spike ($consecutiveSpikes). Origin: $spikeOrigin"
+            }
 
-            Write-Host "  Game servers:" -ForegroundColor Cyan
+            if ($gatewayTarget) {
+                $gw = $statsByName[[string]$gatewayTarget.name]
+                $gwLatest = if ($null -eq $gw.latest_ms) { "TIMEOUT" } else { "{0}ms" -f [math]::Round([double]$gw.latest_ms) }
+                $gwColor = if ($null -eq $gw.latest_ms) { "DarkGray" } elseif ([double]$gw.latest_ms -ge 10.0 -and [double]$gw.latest_ms -ge ([double]$gw.avg_ms * 2.0)) { "Yellow" } else { "White" }
+                Write-Host ("  Local link: {0,-28} latest={1,-9} avg={2,6:N1}ms  jitter={3,5:N1}ms  loss={4,5:N1}%" -f "$($gatewayTarget.name) $($gatewayTarget.host)", $gwLatest, [double]$gw.avg_ms, [double]$gw.jitter_ms, [double]$gw.loss_percent) -ForegroundColor $gwColor
+            }
+
+            Write-Host "  Configured game reference hosts (not necessarily match servers):" -ForegroundColor Cyan
             foreach ($m in $monitors) {
                 $name = [string]$m.name
                 $st = $statsByName[$name]
@@ -750,7 +1095,7 @@ try {
                 Write-Host ("  {0} {1,-28} latest={2,-9} avg={3,6:N1}ms  jitter={4,5:N1}ms  loss={5,5:N1}%" -f $marker, $name, $latest, [double]$st.avg_ms, [double]$st.jitter_ms, [double]$st.loss_percent) -ForegroundColor $lineColor
             }
 
-            Write-Host "  Routes:" -ForegroundColor Cyan
+            Write-Host "  Internet reference probes (all use the current connection):" -ForegroundColor Cyan
             foreach ($rt in $routeTargets) {
                 $name = [string]$rt.name
                 $st = $statsByName[$name]
@@ -769,5 +1114,9 @@ try {
     }
 } finally {
     Restore-OriginalDns
+    if ([bool]$stabilize.enabled -and $script:IsAdmin) {
+        Write-Log -Message "Undoing session stabilization..."
+        Stop-SessionStabilization
+    }
     Write-Log -Message "Stabilizer stopped."
 }

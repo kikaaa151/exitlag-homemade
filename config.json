@@ -2,23 +2,28 @@
   "games": [
     {
       "name": "League of Legends",
-      "hosts": ["leagueoflegends.com", "riotgames.com"]
+      "hosts": ["leagueoflegends.com", "riotgames.com"],
+      "processes": ["League of Legends"]
     },
     {
       "name": "Valorant",
-      "hosts": ["playvalorant.com", "riotgames.com"]
+      "hosts": ["playvalorant.com", "riotgames.com"],
+      "processes": ["VALORANT-Win64-Shipping"]
     },
     {
       "name": "World of Tanks",
-      "hosts": ["worldoftanks.com", "worldoftanks.eu"]
+      "hosts": ["worldoftanks.com", "worldoftanks.eu"],
+      "processes": ["WorldOfTanks"]
     },
     {
       "name": "Minecraft (Hypixel)",
-      "hosts": ["mc.hypixel.net"]
+      "hosts": ["mc.hypixel.net"],
+      "processes": ["javaw", "Minecraft.Windows"]
     },
     {
       "name": "CS2 / Dota (Steam)",
-      "hosts": ["steamcommunity.com"]
+      "hosts": ["steamcommunity.com"],
+      "processes": ["cs2", "dota2"]
     }
   ],
   "routes": [
@@ -58,13 +63,22 @@
     "consecutive_spikes_for_action": 3
   },
   "actions": {
-    "enabled": true,
-    "apply_tcp_profile": true,
+    "enabled": false,
+    "apply_tcp_profile": false,
     "flush_dns_on_spike": false,
     "reset_adapter_on_spike": false,
-    "run_profile_command_on_switch": true,
+    "run_profile_command_on_switch": false,
     "allow_warp_auto_switch": false,
-    "allow_dns_route_switch": true
+    "allow_dns_route_switch": false
+  },
+  "stabilize": {
+    "enabled": true,
+    "revert_legacy_tweaks": true,
+    "pause_background_downloads": true,
+    "suppress_wifi_scanning": true,
+    "disable_adapter_power_saving": true,
+    "boost_game_process_priority": true,
+    "prioritize_game_traffic_dscp": true
   },
   "runtime": {
     "interval_seconds": 2.0,
